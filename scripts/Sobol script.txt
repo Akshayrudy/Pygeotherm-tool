@@ -1,0 +1,95 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from SALib.sample import saltelli
+from SALib.analyze import sobol
+
+# 1. EXACT BOUNDS MATCHING YOUR LHS TRAINING DATA
+problem = {
+    'num_vars': 4,
+    'names': [
+        r'Injection Rate ($\boldsymbol{Q}$)',
+        r'Temp Differential ($\boldsymbol{ΔT}$)',
+        r'Regional Gradient ($\boldsymbol{\nabla h}$)',
+        r'Conductivity ($\boldsymbol{K}$)'
+],
+    'bounds': [
+        [10.0, 100.0],     # Injection rate (Q_m3_day)
+        [16.0, 25.0],      # 2. Injection temperature
+        [0.001, 0.005],    # 3. Groundwater gradient
+        [1.0, 50.0]        # Hydraulic conductivity (K_m_day)
+    ]
+}
+
+# 2. Generate 10,240 samples
+param_values = saltelli.sample(problem, 1024, calc_second_order=True)
+
+# 3. Define your AI Master Equation
+def calculate_radius(params):
+    Q = params[:, 0]
+    T = params[:, 1]
+    g = params[:, 2]
+    K = params[:, 3]
+
+    r = ((((T - 3.5191402) * 10.238261) + Q) * g) * (K / 0.015464533)
+    return np.maximum(r, 0.0)
+
+# 4. Run the equation
+Y_predictions = calculate_radius(param_values)
+
+# 5. Calculate Sobol Indices
+Si = sobol.analyze(problem, Y_predictions, print_to_console=False)
+
+# 6. Print Q1 Journal Ready Results to Terminal
+print("==================================================")
+print("📊 SOBOL SENSITIVITY ANALYSIS RESULTS")
+print("==================================================")
+print(f"{'Variable':<15} | {'First–Order (S1)':<18} | {'Total–Order (ST)':<18}")
+print("-" * 50)
+
+for i in range(problem['num_vars']):
+    name = problem['names'][i]
+    s1_pct = Si['S1'][i] * 100  # Converted to percentage
+    st_pct = Si['ST'][i] * 100  # Converted to percentage
+    print(f"{name:<15} | {s1_pct:>14.2f} % | {st_pct:>14.2f} %")
+
+print("==================================================")
+
+# ==============================================================================
+# 7. PUBLICATION-READY BAR CHART
+# ==============================================================================
+plt.figure(figsize=(9, 6))
+
+x = np.arange(len(problem['names']))
+width = 0.35
+
+S1_vals = Si['S1']
+ST_vals = Si['ST']
+
+# Plot First-Order and Total-Order side-by-side
+bars1 = plt.bar(x - width/2, S1_vals, width, label='First–Order (S1) — Main Effect', color='#1f77b4', edgecolor='k')
+bars2 = plt.bar(x + width/2, ST_vals, width, label='Total–Order (ST) — Including Interactions', color='#ff7f0e', edgecolor='k')
+
+# Formatting for Q1 Journals
+plt.ylabel('Sobol Sensitivity Index (Variance Fraction)', fontsize=12, fontweight='bold')
+plt.title('Global Variance–Based Sensitivity Analysis of Thermal Plume Radius', fontsize=14, fontweight='bold', pad=15)
+plt.xticks(x, problem['names'], fontsize=11, fontweight='bold')
+
+# Dynamically set Y-axis height so text labels don't get cut off
+plt.ylim(0, max(max(S1_vals), max(ST_vals)) + 0.15)
+plt.grid(axis='y', linestyle='--', alpha=0.6)
+plt.legend(loc='upper right', fontsize=11, frameon=True)
+
+# Add exact decimal labels on top of the bars
+for bar in bars1:
+    yval = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width()/2, yval + 0.01, f'{yval:.3f}', ha='center', va='bottom', fontsize=10)
+for bar in bars2:
+    yval = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width()/2, yval + 0.01, f'{yval:.3f}', ha='center', va='bottom', fontsize=10)
+
+# Save high-res image
+out_file = "../data/Sobol_Sensitivity_Plot_Corrected_2.png"
+plt.tight_layout()
+plt.savefig(out_file, dpi=300)
+print(f"\n✅ Publication figure saved successfully to: {out_file}")
+plt.show()

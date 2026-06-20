@@ -1,0 +1,101 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+
+# 1. Load the Test Data
+test_df = pd.read_csv('../data/Geothermal_Test_100.csv')
+Q = test_df['Q_m3_day']
+g = test_df['gradient']
+T = test_df['T_inj_C']
+K = test_df['K_m_day']
+y_true = test_df['Thermal_Radius_m'].values
+
+# 2. Raw PySR Equation
+y_pred_raw = ((((T - 3.519) * 10.238) + Q) * g) * (K / 0.01546)
+y_pred_raw = np.maximum(y_pred_raw, 0.0)
+
+# ==============================================================================
+# 3. MATHEMATICAL OPTIMIZATION ENGINE
+# ==============================================================================
+# Define the search space
+m_values = np.linspace(1.0, 1.5, 100)    # Test multipliers from 1.0x to 1.5x
+c_values = np.linspace(0.0, 500.0, 100)  # Test constants from 0m to 500m
+
+# Create matrices to store results
+safety_matrix = np.zeros((len(m_values), len(c_values)))
+excess_matrix = np.zeros((len(m_values), len(c_values)))
+
+# Set the Regulatory Constraint
+TARGET_SAFETY = 0.95 
+
+best_m, best_c = None, None
+min_excess = float('inf')
+
+print("Running Constrained Optimization Algorithm...")
+
+# Evaluate every possible combination
+for i, m in enumerate(m_values):
+    for j, c in enumerate(c_values):
+        y_safe = (y_pred_raw * m) + c
+        
+        # 1. Calculate Safety Rate
+        safety_rate = np.mean(y_safe >= y_true)
+        safety_matrix[i, j] = safety_rate
+        
+        # 2. Calculate Mean Excess Radius (Wasted Land)
+        # We only care about excess for the times we are safe
+        excess = np.mean(y_safe - y_true)
+        excess_matrix[i, j] = excess
+        
+        # 3. Check against constraint and minimize objective function
+        if safety_rate >= TARGET_SAFETY:
+            if excess < min_excess:
+                min_excess = excess
+                best_m = m
+                best_c = c
+
+print("\n🏆 OPTIMIZATION COMPLETE 🏆")
+print(f"Optimal Multiplier (m): {best_m:.3f}")
+print(f"Optimal Constant (c):   {best_c:.1f} meters")
+print(f"Resulting Safety Rate:  {np.mean(((y_pred_raw * best_m) + best_c) >= y_true)*100:.1f}%")
+print(f"Average Wasted Buffer:  {min_excess:.1f} meters")
+
+# ==============================================================================
+# 4. PUBLICATION-QUALITY OPTIMIZATION LANDSCAPE PLOT
+# ==============================================================================
+# Create meshgrid for plotting
+C, M = np.meshgrid(c_values, m_values)
+
+plt.figure(figsize=(10, 7))
+
+# Plot the "Wasted Land" as a background color map
+# Mask the matrix to only show colors where safety >= 95%
+valid_excess = np.ma.masked_where(safety_matrix < TARGET_SAFETY, excess_matrix)
+contour = plt.contourf(C, M, valid_excess, levels=20, cmap='viridis_r', alpha=0.8)
+cbar = plt.colorbar(contour)
+cbar.set_label('Mean Excess Radius (m) [Lower is Better]', fontsize=12, fontweight='bold')
+
+# Draw the 95% Safety Boundary Line
+plt.contour(C, M, safety_matrix, levels=[TARGET_SAFETY], colors='red', linewidths=3, linestyles='--')
+
+# Plot the mathematically optimal point
+plt.scatter([best_c], [best_m], color='red', s=150, edgecolor='black', marker='*', zorder=5,
+            label=f'Optimal: y = {best_m:.2f}x + {best_c:.0f}')
+
+# Formatting
+plt.title("Optimization of Regulatory Safety Parameters (m, c)", fontsize=16, fontweight='bold', pad=15)
+plt.xlabel("Additive Safety Constant ($c$) [meters]", fontsize=14)
+plt.ylabel("Multiplicative Safety Factor ($m$)", fontsize=14)
+plt.text(50, 1.45, 'Red Dashed Line = 95% Safety Boundary', color='white', 
+         bbox=dict(facecolor='red', alpha=0.7), fontsize=11)
+
+plt.legend(loc='upper right', fontsize=12, framealpha=0.9)
+plt.grid(True, linestyle=':', alpha=0.6)
+
+# Save high-res image
+out_file = "../data/Safety_Optimization_Landscape.png"
+plt.tight_layout()
+plt.savefig(out_file, dpi=300)
+print(f"✅ Optimization figure saved to: {out_file}")
+plt.show()

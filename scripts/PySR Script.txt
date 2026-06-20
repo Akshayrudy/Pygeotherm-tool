@@ -1,0 +1,65 @@
+import pandas as pd
+from pysr import PySRRegressor
+
+# ==============================================================================
+# 1. LOAD THE TRAINING DATA
+# ==============================================================================
+print("Loading the 400-row Training Data...")
+train_df = pd.read_csv('../data/Geothermal_Train_400.csv')
+
+# Separate the inputs (X) from the target answer (y)
+X = train_df.drop(columns=['Thermal_Radius_m'])
+y = train_df['Thermal_Radius_m']
+
+print(f"Features loaded: {list(X.columns)}")
+
+# ==============================================================================
+# 2. CONFIGURE THE SYMBOLIC REGRESSION AI
+# ==============================================================================
+print("\nIgniting PySR Evolutionary Engine...")
+
+model = PySRRegressor(
+    # How long the AI searches (40 is a great starting point for 7 variables)
+    niterations=40,
+
+    # The basic math it is allowed to use
+    binary_operators=["+", "-", "*", "/"],
+
+    # Advanced math allowed.
+    # 'sqrt' is crucial because your radius is based on the Pythagorean theorem.
+    # 'exp' is crucial because heat decay is often exponential.
+    unary_operators=["sqrt", "exp"],
+
+    # Penalize massive, unpublishable equations. We want elegant physics, not spaghetti math.
+    maxsize=25,
+
+    # Automatically select the equation that balances simplicity and accuracy
+    model_selection="best",
+
+    # Save the history so you can review the evolution
+#    temp_equation_file="../data/PySR_Geothermal_Equations.csv"
+)
+
+# ==============================================================================
+# 3. TRAIN THE MODEL
+# ==============================================================================
+model.fit(X, y)
+
+print("Saving custom equations file...")
+
+# Grab the dataframe directly from the AI
+my_equations = model.equations_
+
+# Save it to your exact WSL path
+custom_path = "../data/PySR_Geothermal_Equations.csv"
+my_equations.to_csv(custom_path, index=False)
+
+print(f"Equations successfully forced to: {custom_path}")
+
+# ==============================================================================
+# 4. VIEW THE RESULTS
+# ==============================================================================
+print("\n" + "="*50)
+print("🏆 SURVIVING EQUATIONS")
+print("="*50)
+print(model.equations_)

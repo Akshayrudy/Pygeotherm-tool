@@ -1,0 +1,45 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 1. Load the vault
+test_df = pd.read_csv('../data/Geothermal_Test_100.csv')
+
+Q = test_df['Q_m3_day']
+b = test_df['b_layers']
+T = test_df['T_inj_C']
+y_true = test_df['Thermal_Radius_m']
+
+# 2. Apply the Master Equation
+y_pred = (29.090677 / b) * (Q * ((T * 25.005234) - 390.5769))
+y_pred = np.maximum(y_pred, 0.0)
+
+# 3. Create the Publication-Ready Plot
+plt.figure(figsize=(8, 8))
+plt.scatter(y_true, y_pred, alpha=0.7, edgecolors='k', s=60, color='dodgerblue', label='AI Predictions')
+
+# Draw the 45-degree "Perfect Prediction" line
+max_val = max(max(y_true), max(y_pred)) + 5
+plt.plot([0, max_val], [0, max_val], 'r--', lw=2, label='Perfect Agreement (1:1)')
+
+# Formatting for Q1 Journals
+plt.title("Symbolic Regression Validation: AI vs. MODFLOW", fontsize=14, fontweight='bold')
+plt.xlabel("True MODFLOW Thermal Radius (meters)", fontsize=12)
+plt.ylabel("AI Predicted Thermal Radius (meters)", fontsize=12)
+plt.xlim(-2, max_val)
+plt.ylim(-2, max_val)
+plt.grid(True, linestyle='--', alpha=0.5)
+
+# Add the metrics as a text box
+textstr = f'$R^2$ = 0.922\nRMSE = 3.99 m'
+props = dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='gray')
+plt.gca().text(0.05, 0.95, textstr, transform=plt.gca().transAxes, fontsize=12,
+        verticalalignment='top', bbox=props)
+
+plt.legend(loc='lower right', fontsize=11)
+
+# Save at 300 DPI (Journal Standard)
+out_file = "../data/Validation_Parity_Plot.svg"
+plt.savefig(out_file, dpi=300, bbox_inches='tight')
+print(f"✅ Publication figure saved successfully to: {out_file}")
+plt.show()

@@ -1,0 +1,226 @@
+import os
+import math
+import numpy as np
+import pandas as pd
+from scipy.stats import qmc
+import flopy
+
+# ==============================================================================
+# 1. GLOBAL PATHS & SETTINGS
+# ==============================================================================
+# Update these paths to match your exact Linux / WSL environment
+WORKSPACE = r"../data/Master script trial (3 sets)"
+MF6_EXE = r"../data/mf6.exe"  
+
+NUM_RUNS = 500           
+PLUME_THRESHOLD = 15.1 # °C threshold for the edge of the plume
+BACKGROUND_TEMP = 15.0 # °C
+
+# Create workspace if it doesn't exist
+if not os.path.exists(WORKSPACE):
+    os.makedirs(WORKSPACE)
+
+# ==============================================================================
+# 2. GENERATE LATIN HYPERCUBE DATASET
+# ==============================================================================
+def generate_lhs_matrix(num_samples):
+    print(f"--- Generating {num_samples} LHS Samples ---")
+    bounds = {
+        'K_m_day':        [1.0, 50.0],     # Hydraulic Conductivity
+        'porosity':       [0.15, 0.30],   # Porosity
+        'gradient':       [0.001, 0.005], # River Gradient (i)
+        'Q_m3_day':       [10.0, 100.0],   # Total Injection Rate
+        'T_inj_C':        [16.0, 25.0],   # Injection Temperature
+        'b_layers':       [6, 30],        # Total Aquifer Thickness (meters)
+        'penetration_pct':[0.10, 1.0]     # Screen Length Ratio
+    }
+    
+    sampler = qmc.LatinHypercube(d=len(bounds), seed=42)
+    sample_matrix = sampler.random(n=num_samples)
+    
+    lower_bounds = [bounds[key][0] for key in bounds]
+    upper_bounds = [bounds[key][1] for key in bounds]
+    scaled_samples = qmc.scale(sample_matrix, lower_bounds, upper_bounds)
+    
+    df = pd.DataFrame(scaled_samples, columns=bounds.keys())
+    
+    # Clean up dimensions into integers
+    df['b_layers'] = np.round(df['b_layers']).astype(int)
+    
+    # Calculate physical Screen Length (Ls) and drop the percentage ratio
+    df['L_s_meters'] = np.round(df['b_layers'] * df['penetration_pct']).astype(int)
+    df['L_s_meters'] = df['L_s_meters'].clip(lower=1) # Screen must be at least 1m
+    df = df.drop(columns=['penetration_pct'])
+    
+    df.insert(0, 'run_id', range(1, num_samples + 1))
+    df['Thermal_Radius_m'] = np.nan # Placeholder for FloPy results
+    
+    lhs_path = os.path.join(WORKSPACE, 'LHS_Input_Matrix_FINAL.csv')
+    df.to_csv(lhs_path, index=False)
+    print(f"LHS Matrix saved to: {lhs_path}\n")
+    return df
+
+# ==============================================================================
+# 3. THE FLOPY ENGINE (RUNS A SINGLE SCENARIO)
+# ==============================================================================
+def run_flopy_model(run_id, K, n, grad, Q_tot, T_inj, b_layers, L_s):
+    sim_name = "master_model"
+    sim_ws = os.path.join(WORKSPACE, "master_run_folder")
+    
+    # --- A. FULLY DYNAMIC GRID SETUP ---
+    v_water = (K * grad) / n
+    thermal_retardation = 2.6 
+    v_heat = v_water / thermal_retardation
+    
+    predicted_downstream_travel = v_heat * 10950.0 
+    
+    # DYNAMIC BUFFERS
+    upstream_buffer = max(20.0, 60.0 - (v_water * 10950.0))
+    downstream_buffer = 60.0 
+    
+    Lx = upstream_buffer + predicted_downstream_travel + downstream_buffer
+    # Doubled the minimum width to 100m, and increased the expansion multipliers
+    Ly = max(100.0, predicted_downstream_travel * 1.5, upstream_buffer * 4.0)
+
+    delr = 1.0 
+    delc = 1.0 
+    
+    ncol = int(Lx / delr)
+    nrow = int(Ly / delc)
+    nlay = b_layers
+    
+    # DYNAMIC WELL PLACEMENT & SCREEN DEPTH
+    well_col = int(upstream_buffer / delr)
+    well_row = int(nrow / 2)
+    
+    start_layer = int((nlay - L_s) / 2)
+    end_layer = start_layer + L_s
+    q_per_layer = Q_tot / L_s
+
+    # DYNAMIC RIVER GRADIENT
+    head_left = 10.0
+    head_right = head_left - (Lx * grad)
+
+    # --- B. INITIALIZE SIMULATION & SOLVERS ---
+    sim = flopy.mf6.MFSimulation(sim_name=sim_name, version='mf6', exe_name=MF6_EXE, sim_ws=sim_ws)
+    tdis = flopy.mf6.ModflowTdis(sim, time_units='DAYS', perioddata=[(10950.0, 300, 1.0)])
+
+    # 1. Flow Solver (Steady-State Symmetric -> Simple + CG)
+    ims_flow = flopy.mf6.ModflowIms(
+        sim, print_option='SUMMARY', complexity='SIMPLE', linear_acceleration='CG',
+        outer_maximum=500, inner_maximum=100, filename=f"{sim_name}_flow.ims"
+    )
+    
+    # 2. Heat Solver (Transient Asymmetric -> Complex + BiCGSTAB)
+    ims_heat = flopy.mf6.ModflowIms(
+        sim, print_option='SUMMARY', complexity='COMPLEX', linear_acceleration='BICGSTAB',
+        outer_maximum=500, inner_maximum=100, filename=f"{sim_name}_heat.ims"
+    )
+
+    # --- C. GROUNDWATER FLOW (GWF) MODEL ---
+    gwf = flopy.mf6.ModflowGwf(sim, modelname='gwf', save_flows=True)
+    sim.register_ims_package(ims_flow, [gwf.name]) # Link Flow Solver
+    
+    dis = flopy.mf6.ModflowGwfdis(gwf, nlay=nlay, nrow=nrow, ncol=ncol, delr=delr, delc=delc, 
+                                  top=10.0, botm=[10.0 - i for i in range(1, nlay + 1)])
+    ic = flopy.mf6.ModflowGwfic(gwf, strt=10.0)
+    
+    npf = flopy.mf6.ModflowGwfnpf(gwf, icelltype=0, save_flows=True, k=K, k22=K, k33=K*0.1)
+    
+    chd_spd = []
+    for k in range(nlay):
+        for i in range(nrow):
+            chd_spd.append([(k, i, 0), head_left, BACKGROUND_TEMP])
+            chd_spd.append([(k, i, ncol - 1), head_right, BACKGROUND_TEMP])
+            
+    chd = flopy.mf6.ModflowGwfchd(gwf, stress_period_data=chd_spd, auxiliary=['TEMPERATURE'], pname='chd')
+    
+    wel_spd = [[(k, well_row, well_col), q_per_layer, T_inj] for k in range(start_layer, end_layer)]
+    wel = flopy.mf6.ModflowGwfwel(gwf, stress_period_data=wel_spd, auxiliary=['TEMPERATURE'], pname='wel')
+    
+    oc = flopy.mf6.ModflowGwfoc(gwf, head_filerecord=f"{sim_name}.hds", budget_filerecord=f"{sim_name}.cbc", 
+                                saverecord=[('HEAD', 'ALL'), ('BUDGET', 'ALL')])
+
+    # --- D. GROUNDWATER ENERGY (GWE) TRANSPORT MODEL ---
+    gwe = flopy.mf6.ModflowGwe(sim, modelname='gwe')
+    sim.register_ims_package(ims_heat, [gwe.name]) # Link Heat Solver
+    
+    dis_gwe = flopy.mf6.ModflowGwedis(gwe, nlay=nlay, nrow=nrow, ncol=ncol, delr=delr, delc=delc, 
+                                      top=10.0, botm=[10.0 - i for i in range(1, nlay + 1)])
+    ic_gwe = flopy.mf6.ModflowGweic(gwe, strt=BACKGROUND_TEMP)
+    
+    adv = flopy.mf6.ModflowGweadv(gwe, scheme='TVD')
+    # Dispersion (alh, ath1, atv) and Conduction (ktw, kts) are combined in GWE!
+    cnd = flopy.mf6.ModflowGwecnd(gwe, alh=2.0, ath1=0.2, atv=0.02, ktw=51840, kts=216000)
+    est = flopy.mf6.ModflowGweest(gwe, porosity=n, heat_capacity_solid=880, density_solid=2650, heat_capacity_water=4184, density_water=1000)    
+
+    sourcerecarray = [('chd', 'AUX', 'TEMPERATURE'), ('wel', 'AUX', 'TEMPERATURE')]
+    ssm = flopy.mf6.ModflowGwessm(gwe, sources=sourcerecarray)
+    
+    oc_gwe = flopy.mf6.ModflowGweoc(gwe, temperature_filerecord=f"{sim_name}.ucn", 
+                                    saverecord=[('TEMPERATURE', 'LAST')])
+
+    # --- E. LINK GWF AND GWE ---
+    gwfgwe = flopy.mf6.ModflowGwfgwe(sim, exgtype='GWF6-GWE6', exgmnamea='gwf', exgmnameb='gwe', 
+                                     filename=f"{sim_name}.gwfgwe")
+
+    # --- F. WRITE & RUN ---
+    sim.write_simulation(silent=True)
+    success, buff = sim.run_simulation(silent=True)
+    
+    if not success:
+        return np.nan
+
+    # --- G. EXTRACT THERMAL RADIUS ---
+    ucn_path = os.path.join(sim_ws, f"{sim_name}.ucn")
+    temp_obj = flopy.utils.HeadFile(ucn_path, text='TEMPERATURE')
+    temp_array = temp_obj.get_alldata()[-1] 
+    
+    heated_cells = np.where(temp_array >= PLUME_THRESHOLD)
+    
+    if len(heated_cells[0]) == 0:
+        return 0.0
+        
+    unique_rc = set(zip(heated_cells[1], heated_cells[2]))
+    max_dist = max(math.sqrt((col - well_col)**2 + (row - well_row)**2) for row, col in unique_rc)
+    
+    return round(max_dist * delr, 2)
+
+# ==============================================================================
+# 4. THE MASTER EXECUTION LOOP
+# ==============================================================================
+if __name__ == "__main__":
+    df_lhs = generate_lhs_matrix(NUM_RUNS)
+    
+    print(f"Starting TEST BATCH of {NUM_RUNS} models...\n")
+    
+    for index, row in df_lhs.iterrows():
+        run_id = int(row['run_id'])
+        
+        # Calculate expected grid length for the console printout
+        v_water = (row['K_m_day'] * row['gradient']) / row['porosity']
+        Lx_est = int(max(20.0, 60.0 - (v_water * 10950.0)) + (v_water / 2.6 * 10950.0) + 60.0)
+        
+        print(f"Running [{run_id}/{NUM_RUNS}] | K:{row['K_m_day']:.2f} | Grid Lx:~{Lx_est}m ...", end=" ")
+        
+        try:
+            # The int() wrappers here prevent the pandas float64 bug
+            radius = run_flopy_model(
+                run_id=run_id,
+                K=row['K_m_day'],
+                n=row['porosity'],
+                grad=row['gradient'],
+                Q_tot=row['Q_m3_day'],
+                T_inj=row['T_inj_C'],
+                b_layers=int(row['b_layers']),
+                L_s=int(row['L_s_meters'])
+            )
+            df_lhs.at[index, 'Thermal_Radius_m'] = radius
+            print(f"Done! Radius: {radius}m")
+        except Exception as e:
+            print(f"FAILED. Error: {e}")
+            df_lhs.at[index, 'Thermal_Radius_m'] = np.nan
+
+    final_output = os.path.join(WORKSPACE, 'LHS_Results_FINAL_500.csv')
+    df_lhs.to_csv(final_output, index=False)
+    print(f"\nSUCCESS! Test batch complete. Check your CSV at: {final_output}")
