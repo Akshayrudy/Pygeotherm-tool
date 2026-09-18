@@ -77,7 +77,7 @@ cbar = plt.colorbar(contour)
 cbar.set_label('Mean Excess Radius (m) [Lower is Better]', fontsize=12, fontweight='bold')
 
 # Draw the 95% Safety Boundary Line
-plt.contour(C, M, safety_matrix, levels=[TARGET_SAFETY], colors='red', linewidths=3, linestyles='--')
+plt.contour(C, M, safety_matrix, levels=[TARGET_SAFETY - 0.001], colors='red', linewidths=3, linestyles='--')
 
 # Plot the mathematically optimal point
 plt.scatter([best_c], [best_m], color='red', s=150, edgecolor='black', marker='*', zorder=5,
